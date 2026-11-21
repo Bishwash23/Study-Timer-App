@@ -51,6 +51,10 @@
   .today{margin-top:20px; text-align:center; color:var(--muted); font-size:13px;}
   .today b{color:var(--text); font-size:15px;}
 
+  .notify-hint{text-align:center; font-size:12px; color:var(--muted);
+               margin-top:14px; line-height:1.5;}
+  .notify-hint .btn{margin-top:8px;}
+
   .grid{display:grid; grid-template-columns:1fr 1fr; gap:10px;}
   .card{background:var(--panel); border-radius:12px; padding:14px;}
   .card .k{color:var(--muted); font-size:11px; letter-spacing:.06em; text-transform:uppercase;}
@@ -78,8 +82,9 @@
 
   .setting{display:flex; align-items:center; justify-content:space-between;
            padding:11px 12px; background:var(--panel); border-bottom:1px solid var(--line);}
-  .setting:first-child{border-radius:12px 12px 0 0;}
-  .setting:last-of-type{border-radius:0 0 12px 12px; border-bottom:0;}
+  .setting.top{border-radius:12px 12px 0 0;}
+  .setting.bottom{border-radius:0 0 12px 12px; border-bottom:0;}
+  .setting.solo{border-radius:12px; border-bottom:0;}
   .setting label{font-size:13px;}
   .setting input[type=number]{width:70px; padding:6px 8px; border-radius:7px;
     border:1px solid var(--line); background:var(--panel2); color:var(--text); font:inherit; text-align:center;}
@@ -117,6 +122,8 @@
     </div>
 
     <div class="today">Today&nbsp; <b id="todayTotal">0m</b></div>
+
+    <div id="notifyHint" class="notify-hint" hidden></div>
   </section>
 
   <!-- ================= STATS ================= -->
@@ -137,7 +144,7 @@
 
   <!-- ================= SETTINGS ================= -->
   <section id="tab-settings" hidden>
-    <div class="setting">
+    <div class="setting top">
       <label>Focus length (min)</label>
       <input type="number" min="1" max="180" data-setting="focusMin" />
     </div>
@@ -161,9 +168,13 @@
       <label>Auto-start next focus</label>
       <input type="checkbox" data-setting="autoStartFocus" />
     </div>
+    <div class="setting bottom">
+      <label>Sound on phase end</label>
+      <input type="checkbox" data-setting="soundOn" />
+    </div>
 
     <h3>Data</h3>
-    <div class="setting">
+    <div class="setting solo">
       <label>Backup</label>
       <div class="btnrow">
         <button class="btn" id="btnExport">Export</button>
@@ -181,6 +192,9 @@
 
 <script>
 'use strict';
+
+/* Shorthand DOM lookup (used everywhere below). */
+const $ = id => document.getElementById(id);
 
 /* crypto.randomUUID polyfill for strict webviews / older engines. */
 if (!crypto.randomUUID) {
@@ -206,6 +220,7 @@ const writeJSON = (k, v) => localStorage.setItem(k, JSON.stringify(v));
 const DEFAULT_SETTINGS = {
   focusMin: 25, breakMin: 5, longBreakMin: 15,
   longBreakEvery: 4, autoStartBreak: true, autoStartFocus: false,
+  soundOn: true,
 };
 
 let sessions = readJSON(K_SESSIONS, []);
@@ -255,12 +270,140 @@ function flushBlock() {
 }
 
 /* =========================================================
+   Browser notifications
+   ========================================================= */
+const notifySupported = 'Notification' in window;
+let phaseTimer = null;                       // exact phase-end timeout
+
+function updateNotifyUI() {
+  const el = $('notifyHint');
+  if (!el) return;
+
+  if (!notifySupported) {
+    el.hidden = false;
+    el.textContent = 'Notifications are not supported in this browser.';
+    return;
+  }
+
+  const p = Notification.permission;
+  if (p === 'granted') {
+    el.hidden = true;
+    el.innerHTML = '';
+  } else if (p === 'denied') {
+    el.hidden = false;
+    el.innerHTML =
+      'Notifications are blocked. Allow them for this site in your browser settings to get alerts.';
+  } else {
+    el.hidden = false;
+    el.innerHTML =
+      'Enable browser notifications to be alerted when a phase ends.<br>' +
+      '<button class="btn" id="btnEnableNotify">Enable notifications</button>';
+    const b = document.getElementById('btnEnableNotify');
+    if (b) b.addEventListener('click', () => requestNotify(true));
+  }
+}
+
+async function requestNotify(force) {
+  if (!notifySupported) return 'unsupported';
+  if (Notification.permission === 'granted') return 'granted';
+  if (Notification.permission === 'denied')  return 'denied';
+  // Without a user gesture, Chrome silently ignores the prompt.
+  // `force` is only true from a click handler.
+  if (!force && !navigator.userActivation?.isActive) return 'default';
+
+  try {
+    const p = await Notification.requestPermission();
+    updateNotifyUI();
+    return p;
+  } catch {
+    return 'default';
+  }
+}
+
+function fireNotify(title, body) {
+  if (!notifySupported || Notification.permission !== 'granted') return;
+  try {
+    const n = new Notification(title, {
+      body,
+      tag: 'study-timer',
+      renotify: true,
+    });
+    n.onclick = () => { window.focus(); n.close(); };
+    setTimeout(() => { try { n.close(); } catch {} }, 8000);
+  } catch { /* some browsers (e.g. mobile Safari) throw; ignore */ }
+}
+
+/* =========================================================
+   Sound (Web Audio API — no external files)
+   ========================================================= */
+let audioCtx = null;
+
+function unlockAudio() {
+  if (!audioCtx) {
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) audioCtx = new AC();
+    } catch { audioCtx = null; }
+  }
+  if (audioCtx && audioCtx.state === 'suspended') {
+    audioCtx.resume().catch(() => {});
+  }
+}
+
+function beep(freq, at, dur, gain = 0.18, type = 'sine') {
+  const osc = audioCtx.createOscillator();
+  const g   = audioCtx.createGain();
+  osc.type = type;
+  osc.frequency.value = freq;
+  g.gain.setValueAtTime(0.0001, at);
+  g.gain.exponentialRampToValueAtTime(gain, at + 0.015);   // fast attack
+  g.gain.exponentialRampToValueAtTime(0.0001, at + dur);   // smooth release
+  osc.connect(g).connect(audioCtx.destination);
+  osc.start(at);
+  osc.stop(at + dur + 0.05);
+}
+
+/* Bell timbre: a sine fundamental plus two inharmonic partials.
+   Real bells are inharmonic (partials aren't integer multiples of the
+   fundamental) — 2.76× and 5.40× are the classic ratios for a struck
+   bell and give it that bright, ringing quality. */
+function bell(freq, at, dur, gain = 0.15) {
+  beep(freq,        at, dur,        gain);
+  beep(freq * 2.76, at, dur * 0.7,  gain * 0.4);
+  beep(freq * 5.40, at, dur * 0.4,  gain * 0.2);
+}
+
+function playChime(kind) {
+  if (!settings.soundOn || !audioCtx) return;
+  if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+  const t = audioCtx.currentTime + 0.02;
+  if (kind === 'focusEnd') {
+    bell(880, t, 0.90);        // A5 — bright, "focus done"
+  } else {
+    bell(587.33, t, 0.70);     // D5 — lower, "back to work"
+  }
+}
+
+// Unlock audio on the very first interaction, so later beeps are allowed
+// even after the tab has been in the background for 25 minutes.
+const unlockOnce = () => {
+  unlockAudio();
+  window.removeEventListener('pointerdown', unlockOnce);
+  window.removeEventListener('keydown', unlockOnce);
+};
+window.addEventListener('pointerdown', unlockOnce);
+window.addEventListener('keydown', unlockOnce);
+
+/* =========================================================
    Controls
    ========================================================= */
 function startTimer() {
   if (timer.status === 'running') return;
+  unlockAudio();                    // this click is the gesture that unlocks audio
   timer.blockStart = Date.now();
   timer.status = 'running';
+  requestNotify(false);
+  schedulePhaseEnd();
   render();
 }
 
@@ -268,6 +411,7 @@ function pauseTimer() {
   if (timer.status !== 'running') return;
   flushBlock();
   timer.status = 'paused';
+  clearTimeout(phaseTimer); phaseTimer = null;
   render();
 }
 
@@ -281,28 +425,55 @@ function resetTimer() {
   timer.phase = 'focus';
   timer.phaseElapsed = 0;
   timer.focusCount = 0;
+  clearTimeout(phaseTimer); phaseTimer = null;
   render();
 }
 
+/* Exact phase-end timeout — far more accurate than setInterval when
+   the tab is backgrounded (Chrome throttles intervals to ~1/min). */
+function schedulePhaseEnd() {
+  clearTimeout(phaseTimer); phaseTimer = null;
+  if (timer.mode !== 'pomodoro' || timer.status !== 'running') return;
+  const remaining = Math.max(0, phaseDurationMs() - liveElapsed());
+  phaseTimer = setTimeout(() => {
+    phaseTimer = null;
+    if (timer.status === 'running' && liveElapsed() >= phaseDurationMs()) {
+      completePhase();
+    } else if (timer.status === 'running') {
+      schedulePhaseEnd();                 // safety net
+    }
+  }, remaining + 30);
+}
+
 function completePhase() {
+  clearTimeout(phaseTimer); phaseTimer = null;
+
+  const finishedPhase = timer.phase;
   flushBlock();
   timer.phaseElapsed = 0;
 
-  if (timer.phase === 'focus') {
+  if (finishedPhase === 'focus') {
     timer.focusCount += 1;
     const isLong = timer.focusCount % settings.longBreakEvery === 0;
     timer.phase = isLong ? 'longBreak' : 'break';
     timer.status = settings.autoStartBreak ? 'running' : 'idle';
+    playChime('focusEnd');
+    fireNotify(
+      'Focus complete',
+      isLong ? 'Great work — take a long break.' : 'Nice — take a short break.'
+    );
   } else {
     timer.phase = 'focus';
     timer.status = settings.autoStartFocus ? 'running' : 'idle';
+    playChime('breakEnd');
+    fireNotify('Break over', 'Back to focus.');
   }
 
-  if (timer.status === 'running') timer.blockStart = Date.now();
-  render();
-  if (window.Notification && Notification.permission === 'granted') {
-    new Notification(timer.phase === 'focus' ? 'Back to work' : 'Take a break');
+  if (timer.status === 'running') {
+    timer.blockStart = Date.now();
+    schedulePhaseEnd();
   }
+  render();
 }
 
 /* =========================================================
@@ -311,11 +482,24 @@ function completePhase() {
    ========================================================= */
 function tick() {
   if (timer.status === 'running' && timer.mode === 'pomodoro') {
-    if (liveElapsed() >= phaseDurationMs()) completePhase();
+    if (liveElapsed() >= phaseDurationMs()) {
+      completePhase();
+    }
   }
   renderClock();
 }
 setInterval(tick, 250);
+
+/* Re-sync immediately when the tab becomes visible after being hidden,
+   since background timers may have drifted. */
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  if (timer.status === 'running' && timer.mode === 'pomodoro') {
+    if (liveElapsed() >= phaseDurationMs()) completePhase();
+    else schedulePhaseEnd();
+  }
+  tick();
+});
 
 /* =========================================================
    Period math
@@ -374,8 +558,6 @@ function fmtHuman(ms) {
 /* =========================================================
    Rendering
    ========================================================= */
-const $ = id => document.getElementById(id);
-
 function renderClock() {
   if (timer.mode === 'stopwatch') {
     $('clock').textContent = fmtClock(Math.floor(liveElapsed() / 1000));
@@ -494,6 +676,15 @@ document.querySelectorAll('[data-setting]').forEach(inp => {
   inp.addEventListener('change', () => {
     settings[key] = inp.type === 'checkbox' ? inp.checked : Number(inp.value);
     writeJSON(K_SETTINGS, settings);
+
+    // Turning the sound toggle ON plays a short bell to confirm.
+    if (key === 'soundOn' && settings.soundOn) {
+      unlockAudio();
+      if (audioCtx) {
+        const t = audioCtx.currentTime + 0.05;
+        bell(880, t, 0.50, 0.12);
+      }
+    }
     resetTimer();
   });
 });
@@ -587,6 +778,7 @@ async function importData(file) {
     }
     settings.autoStartBreak = !!settings.autoStartBreak;
     settings.autoStartFocus = !!settings.autoStartFocus;
+    settings.soundOn        = settings.soundOn !== false;
     writeJSON(K_SETTINGS, settings);
     syncSettingsInputs();
     resetTimer();                          // matches the "changing a length restarts" rule
@@ -623,11 +815,10 @@ window.addEventListener('keydown', e => {
 // don't lose a running block when the window closes
 window.addEventListener('beforeunload', flushBlock);
 
-// notifications (optional, best-effort)
-if (window.Notification && Notification.permission === 'default') {
-  Notification.requestPermission().catch(() => {});
-}
-
+/* =========================================================
+   Init
+   ========================================================= */
+updateNotifyUI();
 render();
 </script>
 </body>
