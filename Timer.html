@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Study Timer</title>
 <style>
   :root{
@@ -78,11 +79,16 @@
   .setting{display:flex; align-items:center; justify-content:space-between;
            padding:11px 12px; background:var(--panel); border-bottom:1px solid var(--line);}
   .setting:first-child{border-radius:12px 12px 0 0;}
-  .setting:last-child{border-radius:0 0 12px 12px; border-bottom:0;}
+  .setting:last-of-type{border-radius:0 0 12px 12px; border-bottom:0;}
   .setting label{font-size:13px;}
   .setting input[type=number]{width:70px; padding:6px 8px; border-radius:7px;
     border:1px solid var(--line); background:var(--panel2); color:var(--text); font:inherit; text-align:center;}
   .setting input[type=checkbox]{width:18px; height:18px; accent-color:var(--accent); cursor:pointer;}
+
+  .btnrow{display:flex; gap:8px;}
+  .btn{border:0; border-radius:9px; padding:8px 14px; cursor:pointer;
+       background:var(--panel2); color:var(--text); font:600 13px/1 inherit;}
+  .btn:hover{filter:brightness(1.1);}
 </style>
 </head>
 <body>
@@ -155,6 +161,18 @@
       <label>Auto-start next focus</label>
       <input type="checkbox" data-setting="autoStartFocus" />
     </div>
+
+    <h3>Data</h3>
+    <div class="setting">
+      <label>Backup</label>
+      <div class="btnrow">
+        <button class="btn" id="btnExport">Export</button>
+        <button class="btn" id="btnImport">Import</button>
+      </div>
+    </div>
+    <input type="file" id="importFile" accept=".json,application/json" hidden />
+    <p class="muted" id="dataMsg" style="padding:12px 2px 0"></p>
+
     <p class="muted" style="padding:16px 2px 0">
       Changing a length restarts the current timer.
     </p>
@@ -163,6 +181,15 @@
 
 <script>
 'use strict';
+
+/* crypto.randomUUID polyfill for strict webviews / older engines. */
+if (!crypto.randomUUID) {
+  crypto.randomUUID = () =>
+    'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+      const r = Math.random() * 16 | 0;
+      return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+    });
+}
 
 /* =========================================================
    Persistence
@@ -452,19 +479,140 @@ $('recentList').addEventListener('click', e => {
   renderStats();
 });
 
-// settings
+/* =========================================================
+   Settings
+   ========================================================= */
+function syncSettingsInputs() {
+  document.querySelectorAll('[data-setting]').forEach(inp => {
+    const key = inp.dataset.setting;
+    if (inp.type === 'checkbox') inp.checked = settings[key];
+    else inp.value = settings[key];
+  });
+}
 document.querySelectorAll('[data-setting]').forEach(inp => {
   const key = inp.dataset.setting;
-  if (inp.type === 'checkbox') inp.checked = settings[key];
-  else inp.value = settings[key];
-
   inp.addEventListener('change', () => {
     settings[key] = inp.type === 'checkbox' ? inp.checked : Number(inp.value);
     writeJSON(K_SETTINGS, settings);
     resetTimer();
   });
 });
+syncSettingsInputs();
 
+/* =========================================================
+   Export / Import
+   ========================================================= */
+function dataMsg(text) { $('dataMsg').textContent = text; }
+
+/** Fold the running block into storage, then keep the timer running. */
+function flushAndContinue() {
+  if (timer.status !== 'running' || timer.blockStart === null) return;
+  const end = Date.now();
+  if (timer.phase === 'focus') addSession(timer.blockStart, end, timer.mode);
+  timer.phaseElapsed += end - timer.blockStart;
+  timer.blockStart = end;                 // continue seamlessly, no gap
+}
+
+function exportData() {
+  flushAndContinue();
+
+  const now = new Date();
+  const payload = {
+    app: 'study-timer',
+    version: 1,
+    exportedAt: now.toISOString(),
+    settings,
+    sessions,
+  };
+
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const stamp = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  a.href = url;
+  a.download = `study-timer-${stamp}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+  dataMsg(`Exported ${sessions.length} session${sessions.length === 1 ? '' : 's'}.`);
+  render();
+}
+
+const isNum = n => typeof n === 'number' && Number.isFinite(n);
+
+function sanitizeSessions(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const s of raw) {
+    if (!s || !isNum(s.start) || !isNum(s.end) || s.end <= s.start) continue;
+    out.push({
+      id: typeof s.id === 'string' && s.id ? s.id : crypto.randomUUID(),
+      start: s.start,
+      end: s.end,
+      mode: s.mode === 'stopwatch' ? 'stopwatch' : 'pomodoro',
+    });
+  }
+  return out;
+}
+
+async function importData(file) {
+  let data;
+  try {
+    data = JSON.parse(await file.text());
+  } catch {
+    dataMsg("Import failed — that file isn't valid JSON.");
+    return;
+  }
+
+  const incoming = sanitizeSessions(Array.isArray(data) ? data : data?.sessions);
+  const known = new Set(sessions.map(s => s.id));
+  let added = 0, skipped = 0;
+  for (const s of incoming) {
+    if (known.has(s.id)) { skipped++; continue; }
+    known.add(s.id);
+    sessions.push(s);
+    added++;
+  }
+  sessions.sort((a, b) => a.start - b.start);
+  writeJSON(K_SESSIONS, sessions);
+
+  let settingsNote = '';
+  if (!Array.isArray(data) && data && data.settings && typeof data.settings === 'object') {
+    settings = { ...DEFAULT_SETTINGS, ...data.settings };
+    for (const k of ['focusMin', 'breakMin', 'longBreakMin', 'longBreakEvery']) {
+      const v = Math.round(Number(settings[k]));
+      settings[k] = Number.isFinite(v) && v > 0 ? v : DEFAULT_SETTINGS[k];
+    }
+    settings.autoStartBreak = !!settings.autoStartBreak;
+    settings.autoStartFocus = !!settings.autoStartFocus;
+    writeJSON(K_SETTINGS, settings);
+    syncSettingsInputs();
+    resetTimer();                          // matches the "changing a length restarts" rule
+    settingsNote = ' Settings restored.';
+  }
+
+  renderStats();
+  render();
+  dataMsg(
+    `Imported ${added} session${added === 1 ? '' : 's'}` +
+    (skipped ? `, skipped ${skipped} duplicate${skipped === 1 ? '' : 's'}` : '') +
+    `.${settingsNote}`
+  );
+}
+
+$('btnExport').addEventListener('click', exportData);
+$('btnImport').addEventListener('click', () => $('importFile').click());
+$('importFile').addEventListener('change', e => {
+  const file = e.target.files && e.target.files[0];
+  e.target.value = '';                     // lets you re-pick the same file
+  if (file) importData(file);
+});
+
+/* =========================================================
+   Keyboard & lifecycle
+   ========================================================= */
 // keyboard: space = start/pause, R = reset
 window.addEventListener('keydown', e => {
   if (e.target.matches('input')) return;
